@@ -1,1 +1,22 @@
-/target
+# Rust
+/target/
+Cargo.lock
+
+# Data directories
+/data/
+*.json
+*.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log

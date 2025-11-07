@@ -93,6 +93,14 @@ impl<T> ApiResponse<T> {
         }
     }
 
+    fn error_msg(message: String) -> Self {
+        ApiResponse {
+            success: false,
+            data: None,
+            message: Some(message),
+        }
+    }
+
     fn error(message: String) -> ApiResponse<()> {
         ApiResponse {
             success: false,
@@ -176,7 +184,7 @@ async fn get_document(
     if let Some(doc) = engine.get_document(&id)? {
         Ok(Json(ApiResponse::success(DocumentResponse::from(doc))))
     } else {
-        Ok(Json(ApiResponse::error(format!(
+        Ok(Json(ApiResponse::error_msg(format!(
             "Document with id '{}' not found",
             id
         ))))
