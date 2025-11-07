@@ -1,12 +1,47 @@
 [package]
 name = "rsfts"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 
+[lib]
+name = "rsfts"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rsfts"
+path = "src/main.rs"
+
 [dependencies]
+# Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+bincode = "1.3"
+
+# XML parsing (for initial data load)
 quick-xml = { version = "0.31", features = ["serialize"] }
 flate2 = "1.0"
+
+# Text processing
 rust-stemmers = "1.2"
+unicode-segmentation = "1.10"
+lazy_static = "1.4"
+
+# Storage
+sled = "0.34"
+
+# HTTP API
+axum = "0.7"
+tokio = { version = "1.35", features = ["full"] }
+tower = "0.4"
+tower-http = { version = "0.5", features = ["cors", "trace"] }
+
+# CLI
 clap = { version = "4.5", features = ["derive"] }
+
+# Error handling
+thiserror = "1.0"
+anyhow = "1.0"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

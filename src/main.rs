@@ -1,259 +1,320 @@
-use clap::Parser;
-use flate2::read::GzDecoder;
-use quick_xml::de::from_reader;
-use rust_stemmers::{Algorithm, Stemmer};
-use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
-use std::fs::File;
-use std::io::{BufReader, Write};
-use std::path::Path;
-use std::time::Instant;
+use clap::{Parser, Subcommand};
+use rsfts::{api, Document, SearchEngine, SearchOptions};
+use std::sync::Arc;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-// CLI Arguments
-#[derive(Parser, Debug)]
-#[command(author, version, about = "Simple Full-Text Search engine in Rust", long_about = None)]
-struct Args {
-    #[arg(short, long, default_value = "enwiki-latest-abstract1.xml.gz")]
-    path: String,
-
-    #[arg(short, long, default_value = "Small wild cat")]
-    query: String,
+#[derive(Parser)]
+#[command(name = "rsfts")]
+#[command(about = "Rust Full-Text Search Engine", version, long_about = None)]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
 }
 
-// Document structure
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct Document {
-    #[serde(default)]
+#[derive(Subcommand)]
+enum Commands {
+    /// Start HTTP API server
+    Serve {
+        #[arg(short, long, default_value = "127.0.0.1")]
+        host: String,
+
+        #[arg(short, long, default_value = "3000")]
+        port: u16,
+
+        #[arg(short = 'd', long, default_value = "./data")]
+        data_dir: String,
+    },
+
+    /// Insert a document (CLI mode)
+    Insert {
+        #[arg(short, long)]
+        id: String,
+
+        #[arg(short, long)]
+        title: String,
+
+        #[arg(short, long)]
+        content: String,
+
+        #[arg(short = 'u', long)]
+        url: Option<String>,
+
+        #[arg(short = 'd', long, default_value = "./data")]
+        data_dir: String,
+    },
+
+    /// Search for documents (CLI mode)
+    Search {
+        #[arg(short, long)]
+        query: String,
+
+        #[arg(short = 'l', long, default_value = "10")]
+        limit: usize,
+
+        #[arg(short = 'r', long, default_value = "true")]
+        ranked: bool,
+
+        #[arg(short = 'd', long, default_value = "./data")]
+        data_dir: String,
+    },
+
+    /// Get document by ID
+    Get {
+        #[arg(short, long)]
+        id: String,
+
+        #[arg(short = 'd', long, default_value = "./data")]
+        data_dir: String,
+    },
+
+    /// Delete a document
+    Delete {
+        #[arg(short, long)]
+        id: String,
+
+        #[arg(short = 'd', long, default_value = "./data")]
+        data_dir: String,
+    },
+
+    /// Show index statistics
+    Stats {
+        #[arg(short = 'd', long, default_value = "./data")]
+        data_dir: String,
+    },
+
+    /// Import documents from Wikipedia XML dump
+    ImportWiki {
+        #[arg(short, long)]
+        file: String,
+
+        #[arg(short = 'd', long, default_value = "./data")]
+        data_dir: String,
+    },
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    // Initialize tracing
+    tracing_subscriber::registry()
+        .with(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "rsfts=info,tower_http=info".into()),
+        )
+        .with(tracing_subscriber::fmt::layer())
+        .init();
+
+    let cli = Cli::parse();
+
+    match cli.command {
+        Commands::Serve {
+            host,
+            port,
+            data_dir,
+        } => {
+            serve(host, port, data_dir).await?;
+        }
+        Commands::Insert {
+            id,
+            title,
+            content,
+            url,
+            data_dir,
+        } => {
+            insert_document(id, title, content, url, data_dir)?;
+        }
+        Commands::Search {
+            query,
+            limit,
+            ranked,
+            data_dir,
+        } => {
+            search_documents(query, limit, ranked, data_dir)?;
+        }
+        Commands::Get { id, data_dir } => {
+            get_document(id, data_dir)?;
+        }
+        Commands::Delete { id, data_dir } => {
+            delete_document(id, data_dir)?;
+        }
+        Commands::Stats { data_dir } => {
+            show_stats(data_dir)?;
+        }
+        Commands::ImportWiki { file, data_dir } => {
+            import_wiki(file, data_dir)?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn serve(host: String, port: u16, data_dir: String) -> anyhow::Result<()> {
+    tracing::info!("Starting search engine with data directory: {}", data_dir);
+    let engine = Arc::new(SearchEngine::new(&data_dir)?);
+
+    let addr = format!("{}:{}", host, port);
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
+
+    tracing::info!("Server listening on http://{}", addr);
+    tracing::info!("API Documentation:");
+    tracing::info!("  GET    /health              - Health check");
+    tracing::info!("  POST   /documents           - Insert a document");
+    tracing::info!("  POST   /documents/batch     - Batch insert documents");
+    tracing::info!("  GET    /documents/:id       - Get a document");
+    tracing::info!("  PUT    /documents/:id       - Update a document");
+    tracing::info!("  DELETE /documents/:id       - Delete a document");
+    tracing::info!("  GET    /search?query=...    - Search documents");
+    tracing::info!("  GET    /stats               - Get index statistics");
+
+    let app = api::create_router(engine);
+
+    axum::serve(listener, app).await?;
+
+    Ok(())
+}
+
+fn insert_document(
+    id: String,
     title: String,
-    #[serde(default)]
-    url: String,
-    #[serde(rename = "abstract", default)]
-    text: String,
-    #[serde(skip_deserializing)]
-    id: usize,
+    content: String,
+    url: Option<String>,
+    data_dir: String,
+) -> anyhow::Result<()> {
+    let engine = SearchEngine::new(&data_dir)?;
+
+    let mut doc = Document::new(id.clone(), title, content);
+    if let Some(url) = url {
+        doc = doc.with_url(url);
+    }
+
+    engine.upsert_document(doc)?;
+
+    println!("✓ Document '{}' inserted successfully", id);
+
+    Ok(())
 }
 
-// Wrapper for XML deserialization
-#[derive(Debug, Deserialize)]
-struct Feed {
-    #[serde(rename = "doc", default)]
-    documents: Vec<Document>,
+fn search_documents(query: String, limit: usize, ranked: bool, data_dir: String) -> anyhow::Result<()> {
+    let engine = SearchEngine::new(&data_dir)?;
+
+    let options = SearchOptions {
+        use_ranking: ranked,
+        limit: Some(limit),
+        ..Default::default()
+    };
+
+    let start = std::time::Instant::now();
+    let result = engine.search(&query, &options)?;
+    let duration = start.elapsed();
+
+    println!("\n🔍 Search Results for: \"{}\"", query);
+    println!("Found {} documents in {:?}", result.total, duration);
+    println!();
+
+    for (i, doc) in result.documents.iter().enumerate() {
+        if let Some(scores) = &result.scores {
+            println!("{}. [Score: {:.4}] {}", i + 1, scores[i], doc.title);
+        } else {
+            println!("{}. {}", i + 1, doc.title);
+        }
+        println!("   ID: {}", doc.id);
+        if let Some(url) = &doc.url {
+            println!("   URL: {}", url);
+        }
+        println!("   Content: {}...", &doc.content[..doc.content.len().min(100)]);
+        println!();
+    }
+
+    Ok(())
 }
 
-// Inverted index type
-type Index = HashMap<String, Vec<usize>>;
+fn get_document(id: String, data_dir: String) -> anyhow::Result<()> {
+    let engine = SearchEngine::new(&data_dir)?;
 
-// Document loading
-fn load_documents(path: &str) -> Result<Vec<Document>, Box<dyn std::error::Error>> {
-    let file = File::open(path)?;
-    let decoder = GzDecoder::new(file);
+    if let Some(doc) = engine.get_document(&id)? {
+        println!("\n📄 Document");
+        println!("ID:      {}", doc.id);
+        println!("Title:   {}", doc.title);
+        if let Some(url) = &doc.url {
+            println!("URL:     {}", url);
+        }
+        println!("Content: {}", doc.content);
+        println!();
+    } else {
+        println!("❌ Document '{}' not found", id);
+    }
+
+    Ok(())
+}
+
+fn delete_document(id: String, data_dir: String) -> anyhow::Result<()> {
+    let engine = SearchEngine::new(&data_dir)?;
+    engine.delete_document(&id)?;
+    println!("✓ Document '{}' deleted successfully", id);
+    Ok(())
+}
+
+fn show_stats(data_dir: String) -> anyhow::Result<()> {
+    let engine = SearchEngine::new(&data_dir)?;
+    let stats = engine.stats()?;
+
+    println!("\n📊 Index Statistics");
+    println!("Total Documents:       {}", stats.total_documents);
+    println!("Total Unique Tokens:   {}", stats.total_tokens);
+    println!("Avg Docs per Token:    {:.2}", stats.avg_docs_per_token);
+    println!();
+
+    Ok(())
+}
+
+fn import_wiki(file: String, data_dir: String) -> anyhow::Result<()> {
+    use flate2::read::GzDecoder;
+    use quick_xml::de::from_reader;
+    use serde::Deserialize;
+    use std::fs::File;
+    use std::io::BufReader;
+
+    #[derive(Debug, Deserialize)]
+    struct WikiDoc {
+        #[serde(default)]
+        title: String,
+        #[serde(default)]
+        url: String,
+        #[serde(rename = "abstract", default)]
+        text: String,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct Feed {
+        #[serde(rename = "doc", default)]
+        documents: Vec<WikiDoc>,
+    }
+
+    println!("Loading Wikipedia dump from: {}", file);
+
+    let f = File::open(&file)?;
+    let decoder = GzDecoder::new(f);
     let reader = BufReader::new(decoder);
 
     let mut feed: Feed = from_reader(reader)?;
 
-    // Assign IDs to documents
-    for (i, doc) in feed.documents.iter_mut().enumerate() {
-        doc.id = i;
-    }
+    println!("Loaded {} documents", feed.documents.len());
+    println!("Indexing documents...");
 
-    Ok(feed.documents)
-}
+    let engine = SearchEngine::new(&data_dir)?;
 
-// Save documents to JSON
-fn save_docs_as_json(docs: &[Document], filename: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let json = serde_json::to_string_pretty(docs)?;
-    let mut file = File::create(filename)?;
-    file.write_all(json.as_bytes())?;
-    Ok(())
-}
-
-// Load documents from JSON
-fn load_docs_from_json(filename: &str) -> Result<Vec<Document>, Box<dyn std::error::Error>> {
-    let file = File::open(filename)?;
-    let reader = BufReader::new(file);
-    let docs = serde_json::from_reader(reader)?;
-    Ok(docs)
-}
-
-// Save index to JSON
-fn save_index_as_json(index: &Index, filename: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let json = serde_json::to_string_pretty(index)?;
-    let mut file = File::create(filename)?;
-    file.write_all(json.as_bytes())?;
-    Ok(())
-}
-
-// Load index from JSON
-fn load_index_from_json(filename: &str) -> Result<Index, Box<dyn std::error::Error>> {
-    let file = File::open(filename)?;
-    let reader = BufReader::new(file);
-    let index = serde_json::from_reader(reader)?;
-    Ok(index)
-}
-
-// Tokenizer
-fn tokenize(text: &str) -> Vec<String> {
-    text.chars()
-        .fold(vec![String::new()], |mut tokens, c| {
-            if c.is_alphanumeric() {
-                if let Some(last) = tokens.last_mut() {
-                    last.push(c);
-                }
-            } else if tokens.last().map_or(false, |s| !s.is_empty()) {
-                tokens.push(String::new());
-            }
-            tokens
+    let docs: Vec<Document> = feed
+        .documents
+        .drain(..)
+        .enumerate()
+        .map(|(i, d)| {
+            Document::new(i.to_string(), d.title, d.text).with_url(d.url)
         })
-        .into_iter()
-        .filter(|s| !s.is_empty())
-        .collect()
-}
-
-// Lowercase filter
-fn lowercase_filter(tokens: Vec<String>) -> Vec<String> {
-    tokens.into_iter().map(|t| t.to_lowercase()).collect()
-}
-
-// Stopword filter
-fn stopword_filter(tokens: Vec<String>) -> Vec<String> {
-    let stopwords: HashSet<&str> = ["a", "and", "be", "have", "i", "in", "of", "that", "the", "to"]
-        .iter()
-        .copied()
         .collect();
 
-    tokens
-        .into_iter()
-        .filter(|t| !stopwords.contains(t.as_str()))
-        .collect()
-}
+    let total = docs.len();
+    engine.batch_insert(docs)?;
 
-// Stemmer filter
-fn stemmer_filter(tokens: Vec<String>) -> Vec<String> {
-    let stemmer = Stemmer::create(Algorithm::English);
-    tokens
-        .into_iter()
-        .map(|t| stemmer.stem(&t).to_string())
-        .collect()
-}
-
-// Analyze text (full pipeline)
-fn analyze(text: &str) -> Vec<String> {
-    let tokens = tokenize(text);
-    let tokens = lowercase_filter(tokens);
-    let tokens = stopword_filter(tokens);
-    let tokens = stemmer_filter(tokens);
-    tokens
-}
-
-// Add documents to index
-fn add_to_index(index: &mut Index, docs: &[Document]) {
-    for doc in docs {
-        for token in analyze(&doc.text) {
-            let ids = index.entry(token).or_insert_with(Vec::new);
-            // Don't add same ID twice
-            if ids.last() != Some(&doc.id) {
-                ids.push(doc.id);
-            }
-        }
-    }
-}
-
-// Intersection of two sorted arrays
-fn intersection(a: &[usize], b: &[usize]) -> Vec<usize> {
-    let mut result = Vec::new();
-    let mut i = 0;
-    let mut j = 0;
-
-    while i < a.len() && j < b.len() {
-        if a[i] < b[j] {
-            i += 1;
-        } else if a[i] > b[j] {
-            j += 1;
-        } else {
-            result.push(a[i]);
-            i += 1;
-            j += 1;
-        }
-    }
-
-    result
-}
-
-// Search in index
-fn search(index: &Index, text: &str) -> Vec<usize> {
-    let tokens = analyze(text);
-    let mut result: Option<Vec<usize>> = None;
-
-    for token in tokens {
-        if let Some(ids) = index.get(&token) {
-            result = Some(match result {
-                None => ids.clone(),
-                Some(r) => intersection(&r, ids),
-            });
-        } else {
-            // Token doesn't exist
-            return Vec::new();
-        }
-    }
-
-    result.unwrap_or_default()
-}
-
-// Perform search and display results
-fn do_search(index: &Index, query: &str, docs: &[Document]) {
-    let start = Instant::now();
-    let matched_ids = search(index, query);
-    let duration = start.elapsed();
-
-    println!("Search found {} documents in {:?}", matched_ids.len(), duration);
-    println!();
-
-    for id in matched_ids {
-        if let Some(doc) = docs.get(id) {
-            println!("{}\t{}", id, doc.text);
-        }
-    }
-}
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args = Args::parse();
-
-    println!("Starting rsfts (Rust Full-Text Search)");
-
-    // Load or deserialize documents
-    let docs = if Path::new("doc.json").exists() {
-        println!("Loading documents from cache...");
-        load_docs_from_json("doc.json")?
-    } else {
-        let start = Instant::now();
-        let docs = load_documents(&args.path)?;
-        let duration = start.elapsed();
-        println!("Loaded {} documents in {:?}", docs.len(), duration);
-
-        save_docs_as_json(&docs, "doc.json")?;
-        docs
-    };
-
-    // Build or load index
-    let index = if Path::new("index.json").exists() {
-        println!("Loading index from cache...");
-        load_index_from_json("index.json")?
-    } else {
-        let start = Instant::now();
-        let mut index = HashMap::new();
-        add_to_index(&mut index, &docs);
-        let duration = start.elapsed();
-        println!("Indexed {} documents in {:?}", docs.len(), duration);
-
-        save_index_as_json(&index, "index.json")?;
-        index
-    };
-
-    // Perform search
-    println!();
-    println!("Searching for: \"{}\"", args.query);
-    println!();
-    do_search(&index, &args.query, &docs);
+    println!("✓ Successfully imported {} documents", total);
 
     Ok(())
 }
